@@ -118,8 +118,8 @@ st.subheader("Input")
 col1, col2 = st.columns(2)
 
 with col1:
-    distance_km = st.number_input("Distance (km)", min_value=0.0, max_value=500.0, value=50.0, step=1.0)
-    weight_lbs = st.number_input("Weight (lbs)", min_value=1.0, value=20.0, step=1.0)
+    distance_km = st.number_input("Distance (km)", min_value=0.0, max_value=500.0, value=0.0, step=1.0)
+    weight_lbs = st.number_input("Weight (lbs)", min_value=0.0, value=0.0, step=1.0)
 
 with col2:
     is_ooa = st.selectbox("Is Out-of-Area?", ["No", "Yes"], index=0) == "Yes"
@@ -206,38 +206,38 @@ if st.button("Calculate", type="primary"):
         st.dataframe(df, use_container_width=True)
 
 # ---------------------- TEST SCENARIOS ----------------------
-with st.expander("Run example test scenarios"):
-    tests = [
-        ("Tiny Z1 (fuel default)", dict(distance_km=50, weight_lbs=20, is_ooa=False, ooa_type="FULL", ooa_km=0,
-                                        flags={}, wait_minutes=0, extra_stops=0, apply_fuel=True, fuel_pct_override=None)),
-        ("Tiny Z1 (fuel off)", dict(distance_km=50, weight_lbs=20, is_ooa=False, ooa_type="FULL", ooa_km=0,
-                                    flags={}, wait_minutes=0, extra_stops=0, apply_fuel=False, fuel_pct_override=None)),
-        ("1,600 lbs @120 km", dict(distance_km=120, weight_lbs=1600, is_ooa=False, ooa_type="FULL", ooa_km=0,
-                                   flags={}, wait_minutes=0, extra_stops=0, apply_fuel=True, fuel_pct_override=None)),
-        ("3,200 lbs @350 km + OOA FULL 60 + tailgate+white+wait50 + 1 extra",
-         dict(distance_km=350, weight_lbs=3200, is_ooa=True, ooa_type="FULL", ooa_km=60,
-              flags={"Tailgate (over 200 lbs)":True, "White Glove (residential)":True}, wait_minutes=50, extra_stops=1,
-              apply_fuel=True, fuel_pct_override=None)),
-        ("5,000 lbs @410 km + direct + 2-man + handbomb",
-         dict(distance_km=410, weight_lbs=5000, is_ooa=False, ooa_type="FULL", ooa_km=0,
-              flags={"Direct Drive (flat)":True, "2 Man Service":True, "Skid Handbomb (lumper)":True},
-              wait_minutes=0, extra_stops=0, apply_fuel=True, fuel_pct_override=None)),
-        ("800 lbs @480 km + OOA Backhaul Empty 120",
-         dict(distance_km=480, weight_lbs=800, is_ooa=True, ooa_type="BACKHAUL EMPTY", ooa_km=120,
-              flags={}, wait_minutes=0, extra_stops=0, apply_fuel=True, fuel_pct_override=None)),
-        ("Fuel override 12%", dict(distance_km=50, weight_lbs=20, is_ooa=False, ooa_type="FULL", ooa_km=0,
-                                   flags={}, wait_minutes=0, extra_stops=0, apply_fuel=True, fuel_pct_override=12)),
-        ("Fuel override 0%", dict(distance_km=50, weight_lbs=20, is_ooa=False, ooa_type="FULL", ooa_km=0,
-                                  flags={}, wait_minutes=0, extra_stops=0, apply_fuel=True, fuel_pct_override=0)),
-    ]
-    rows = []
-    for name, kw in tests:
-        res = calculate(**kw)
-        res["Scenario"] = name
-        rows.append(res)
-    tdf = pd.DataFrame(rows)
-    st.dataframe(tdf[
-        ["Scenario","Zone","Weight Bracket","Rate per lb","Base LTL","OOA charge",
-         "Accessorials (non-fuel)","Wait Time charge","Extra Stops amount",
-         "Fuelable Subtotal","Fuel % used","Fuel amount","Grand Total"]
-    ], use_container_width=True)
+# with st.expander("Run example test scenarios"):
+#     tests = [
+#         ("Tiny Z1 (fuel default)", dict(distance_km=50, weight_lbs=20, is_ooa=False, ooa_type="FULL", ooa_km=0,
+#                                         flags={}, wait_minutes=0, extra_stops=0, apply_fuel=True, fuel_pct_override=None)),
+#         ("Tiny Z1 (fuel off)", dict(distance_km=50, weight_lbs=20, is_ooa=False, ooa_type="FULL", ooa_km=0,
+#                                     flags={}, wait_minutes=0, extra_stops=0, apply_fuel=False, fuel_pct_override=None)),
+#         ("1,600 lbs @120 km", dict(distance_km=120, weight_lbs=1600, is_ooa=False, ooa_type="FULL", ooa_km=0,
+#                                    flags={}, wait_minutes=0, extra_stops=0, apply_fuel=True, fuel_pct_override=None)),
+#         ("3,200 lbs @350 km + OOA FULL 60 + tailgate+white+wait50 + 1 extra",
+#          dict(distance_km=350, weight_lbs=3200, is_ooa=True, ooa_type="FULL", ooa_km=60,
+#               flags={"Tailgate (over 200 lbs)":True, "White Glove (residential)":True}, wait_minutes=50, extra_stops=1,
+#               apply_fuel=True, fuel_pct_override=None)),
+#         ("5,000 lbs @410 km + direct + 2-man + handbomb",
+#          dict(distance_km=410, weight_lbs=5000, is_ooa=False, ooa_type="FULL", ooa_km=0,
+#               flags={"Direct Drive (flat)":True, "2 Man Service":True, "Skid Handbomb (lumper)":True},
+#               wait_minutes=0, extra_stops=0, apply_fuel=True, fuel_pct_override=None)),
+#         ("800 lbs @480 km + OOA Backhaul Empty 120",
+#          dict(distance_km=480, weight_lbs=800, is_ooa=True, ooa_type="BACKHAUL EMPTY", ooa_km=120,
+#               flags={}, wait_minutes=0, extra_stops=0, apply_fuel=True, fuel_pct_override=None)),
+#         ("Fuel override 12%", dict(distance_km=50, weight_lbs=20, is_ooa=False, ooa_type="FULL", ooa_km=0,
+#                                    flags={}, wait_minutes=0, extra_stops=0, apply_fuel=True, fuel_pct_override=12)),
+#         ("Fuel override 0%", dict(distance_km=50, weight_lbs=20, is_ooa=False, ooa_type="FULL", ooa_km=0,
+#                                   flags={}, wait_minutes=0, extra_stops=0, apply_fuel=True, fuel_pct_override=0)),
+#     ]
+#     rows = []
+#     for name, kw in tests:
+#         res = calculate(**kw)
+#         res["Scenario"] = name
+#         rows.append(res)
+#     tdf = pd.DataFrame(rows)
+#     st.dataframe(tdf[
+#         ["Scenario","Zone","Weight Bracket","Rate per lb","Base LTL","OOA charge",
+#          "Accessorials (non-fuel)","Wait Time charge","Extra Stops amount",
+#          "Fuelable Subtotal","Fuel % used","Fuel amount","Grand Total"]
+#     ], use_container_width=True)
