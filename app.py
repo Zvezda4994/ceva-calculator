@@ -82,12 +82,16 @@ def extract_consignee_from_page(page) -> list:
                 continue
             if any(sw in low for sw in stop):
                 break
-            if len(line) < 3 or re.match(r"^\d{7,}$", line) or line.endswith("..."):
+            if len(line) < 3 or re.match(r"^\d{7,}$", line):
                 continue
             # Strip trailing merged columns (3+ spaces = new column)
             line = re.split(r"\s{3,}", line)[0].strip()
+            # Clean trailing truncation dots from names (keep the name)
+            line = re.sub(r"\.{2,}$", "", line).strip()
             # Skip known noise tokens
             if line in ("NOVA", "YOW", "YUL", "YYZ", "ECO", "APT", "THD", "WGD"):
+                continue
+            if len(line) < 3:
                 continue
             if line:
                 result.append(line)
@@ -117,10 +121,13 @@ def extract_shipper_from_page(page) -> list:
                 continue
             if any(sw in low for sw in stop):
                 break
-            if len(line) < 3 or re.match(r"^\d{7,}$", line) or line.endswith("..."):
+            if len(line) < 3 or re.match(r"^\d{7,}$", line):
                 continue
             line = re.split(r"\s{3,}", line)[0].strip()
+            line = re.sub(r"\.{2,}$", "", line).strip()
             if line in ("NOVA", "YOW", "YUL", "YYZ", "ECO", "APT", "THD", "WGD"):
+                continue
+            if len(line) < 3:
                 continue
             if line:
                 result.append(line)
