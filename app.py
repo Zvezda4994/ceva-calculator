@@ -61,8 +61,77 @@ def extract_address_block(lines: list, start_label: str, stop_words: set) -> lis
     return result_lines
 
 
-def parse_waybill_page(text: str) -> dict:
-    """Parse extracted text from one waybill page. Returns parsed fields dict."""
+def extract_consignee_from_page(page) -> list:
+    """
+    Extract consignee address lines using bounding box crop.
+    Returns list of clean address lines.
+    """
+    try:
+        w, h  = page.width, page.height
+        crop  = page.crop((w * 0.35, h * 0.08, w * 0.65, h * 0.40))
+        text  = crop.extract_text() or ""
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        stop  = {"house/ref", "pickup date", "service/de", "prepaid", "attn", "collect"}
+        result     = []
+        skip_label = True
+        for line in lines:
+            low = line.lower()
+            if skip_label:
+                if "consignataire" in low or "consignee" in low:
+                    skip_label = False
+                continue
+            if any(sw in low for sw in stop):
+                break
+            if len(line) < 3 or re.match(r"^\d{7,}$", line) or line.endswith("..."):
+                continue
+            # Strip trailing merged columns (3+ spaces = new column)
+            line = re.split(r"\s{3,}", line)[0].strip()
+            # Skip known noise tokens
+            if line in ("NOVA", "YOW", "YUL", "YYZ", "ECO", "APT", "THD", "WGD"):
+                continue
+            if line:
+                result.append(line)
+        return result
+    except Exception:
+        return []
+
+
+def extract_shipper_from_page(page) -> list:
+    """
+    Extract shipper address lines using bounding box crop (left column).
+    Returns list of clean address lines.
+    """
+    try:
+        w, h  = page.width, page.height
+        crop  = page.crop((0, h * 0.08, w * 0.35, h * 0.40))
+        text  = crop.extract_text() or ""
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        stop  = {"house/ref", "pickup date", "service/de", "prepaid", "attn", "collect"}
+        result     = []
+        skip_label = True
+        for line in lines:
+            low = line.lower()
+            if skip_label:
+                if "expéditeur" in low or "shipper" in low:
+                    skip_label = False
+                continue
+            if any(sw in low for sw in stop):
+                break
+            if len(line) < 3 or re.match(r"^\d{7,}$", line) or line.endswith("..."):
+                continue
+            line = re.split(r"\s{3,}", line)[0].strip()
+            if line in ("NOVA", "YOW", "YUL", "YYZ", "ECO", "APT", "THD", "WGD"):
+                continue
+            if line:
+                result.append(line)
+        return result
+    except Exception:
+        return []
+
+
+def parse_waybill_page(text: str, page=None) -> dict:
+    """Parse extracted text from one waybill page. Returns parsed fields dict.
+    Pass page object for crop-based address extraction (more accurate)."""
     result = {
         "consignee_name":    "",
         "consignee_address": "",
@@ -91,7 +160,7 @@ def parse_waybill_page(text: str) -> dict:
             result["parse_notes"].append(f"Weight converted: {weight_match.group(1)} kg → {val} lbs")
         result["weight_lbs"] = round(val, 3)
     else:
-        result["parse_notes"].append("Weight not found — enter manually.")
+        result["parse_notes"].append("weight_missing")
 
     # --- DG Number ---
     dg_match = re.search(r'((?:DG|GD)\d{3}-\d{7})', text)
@@ -110,31 +179,38 @@ def parse_waybill_page(text: str) -> dict:
         if len(val) >= 4:
             result["ref_no"] = val
 
-    # Shared stop words for both address blocks
-    stop_words = {
-        "house/ref", "attn:", "pickup date", "service/de", "prepaid",
-        "dangerous", "good desc", "billing party", "dimensions",
-        "special inst", "references", "collect/port"
-    }
+    # --- Consignee block — crop-based if page object available, text fallback ---
+    if page is not None:
+        consignee_lines = extract_consignee_from_page(page)
+    else:
+        stop_words = {
+            "house/ref", "attn:", "pickup date", "service/de", "prepaid",
+            "dangerous", "good desc", "billing party", "dimensions",
+            "special inst", "references", "collect/port"
+        }
+        consignee_lines = extract_address_block(
+            lines, "consignee / consignataire",
+            stop_words | {"shipper", "expéditeur"},
+        )
 
-    # --- Consignee block ---
-    consignee_lines = extract_address_block(
-        lines,
-        start_label="consignee / consignataire",
-        stop_words=stop_words | {"shipper", "expéditeur"},
-    )
     if consignee_lines:
         result["consignee_name"]    = consignee_lines[0]
         result["consignee_address"] = ", ".join(consignee_lines[1:]) if len(consignee_lines) > 1 else ""
-    else:
-        result["parse_notes"].append("Consignee not found — enter manually.")
 
-    # --- Shipper block (needed for pickup jobs) ---
-    shipper_lines = extract_address_block(
-        lines,
-        start_label="shipper / expéditeur",
-        stop_words=stop_words | {"consignee", "consignataire"},
-    )
+    # --- Shipper block — crop-based if page object available ---
+    if page is not None:
+        shipper_lines = extract_shipper_from_page(page)
+    else:
+        stop_words = {
+            "house/ref", "attn:", "pickup date", "service/de", "prepaid",
+            "dangerous", "good desc", "billing party", "dimensions",
+            "special inst", "references", "collect/port"
+        }
+        shipper_lines = extract_address_block(
+            lines, "shipper / expéditeur",
+            stop_words | {"consignee", "consignataire"},
+        )
+
     if shipper_lines:
         result["shipper_name"]    = shipper_lines[0]
         result["shipper_address"] = ", ".join(shipper_lines[1:]) if len(shipper_lines) > 1 else ""
@@ -142,7 +218,6 @@ def parse_waybill_page(text: str) -> dict:
     # --- Routing address: shipper for pickups, consignee for deliveries ---
     if result["is_pickup"]:
         result["routing_address"] = f'{result["shipper_name"]} {result["shipper_address"]}'.strip()
-        result["parse_notes"].append("Pickup detected — routing to shipper address.")
     else:
         result["routing_address"] = f'{result["consignee_name"]} {result["consignee_address"]}'.strip()
 
@@ -184,7 +259,7 @@ def parse_waybill(pdf_bytes: bytes) -> dict:
             barcode_val = decode_barcode_from_page(page)
     except Exception as e:
         return {"error": f"Could not read PDF: {e}"}
-    result = parse_waybill_page(text)
+    result = parse_waybill_page(text, page=page)
     if barcode_val:
         result["dg_number"]    = barcode_val
         result["barcode_read"] = True
@@ -219,7 +294,7 @@ def parse_waybill_batch(pdf_bytes: bytes) -> list:
         pages_objs = [None] * len(pages_text)
 
     for i, text in enumerate(pages_text):
-        parsed      = parse_waybill_page(text)
+        parsed      = parse_waybill_page(text, page=page_obj)
         # Try barcode decode for this page
         page_obj    = pages_objs[i] if i < len(pages_objs) else None
         barcode_val = decode_barcode_from_page(page_obj) if page_obj else ""
@@ -372,9 +447,11 @@ if uploaded is not None:
                 st.session_state.pdf_dg        = parsed["dg_number"]
                 st.session_state.pdf_parsed    = True
 
-                if parsed["parse_notes"]:
-                    for note in parsed["parse_notes"]:
-                        st.warning(f"⚠️ {note}")
+                if "weight_missing" in parsed["parse_notes"]:
+                    st.info("📋 Weight not found in PDF — enter it below.")
+                for note in parsed["parse_notes"]:
+                    if "kg" in note.lower():
+                        st.info(f"ℹ️ {note}")
 
 # Batch queue navigator
 if st.session_state.batch_mode and st.session_state.batch_queue:
@@ -393,9 +470,12 @@ if st.session_state.batch_mode and st.session_state.batch_queue:
         st.session_state.pdf_dg        = current["dg_number"]
         st.session_state.pdf_parsed    = True
 
-        if current["parse_notes"]:
+        if "weight_missing" in current.get("parse_notes", []):
+            st.info("📋 Weight not found in PDF — enter it below.")
+        if current.get("parse_notes") and any("kg" in n for n in current["parse_notes"]):
             for note in current["parse_notes"]:
-                st.warning(f"⚠️ {note}")
+                if "kg" in note:
+                    st.info(f"ℹ️ {note}")
     else:
         st.success("✅ All waybills in this batch have been processed.")
         st.session_state.batch_mode = False
