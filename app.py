@@ -1,5 +1,6 @@
+import io
 import math
-from datetime import date
+from datetime import date, datetime
 import pandas as pd
 import streamlit as st
 
@@ -23,8 +24,8 @@ RATES = {
 OOA_RATE = {"FULL": 1.50, "BACKHAUL EMPTY": 0.80, "BACKHAUL FULL": 1.00}
 
 ACCESSORIALS = {
-    "2 Man Service":             25.0,
-    "Tailgate (over 200 lbs)":   15.0,  # auto-applied when weight > 200
+    "2 Man Service":             25.0,  # internal policy: auto-apply > 70 lbs
+    "Tailgate (over 200 lbs)":   15.0,  # auto-apply > 200 lbs
     "Inside Delivery":           25.0,
     "White Glove (residential)": 80.0,  # includes 2-man/TG/Inside
     "Skid Handbomb (lumper)":    40.0,
@@ -61,20 +62,16 @@ def calculate(
     bracket, rate_per_lb = bracket_and_rate(weight_lbs, zone)
     base = max(MIN_CHARGE[zone], rate_per_lb * weight_lbs)
 
-    # Out-of-area
     ooa_charge = OOA_RATE[ooa_type] * ooa_km if is_ooa and ooa_km > 0 else 0.0
 
-    # Accessorials
     acc = sum(v for k, v in ACCESSORIALS.items() if flags.get(k, False))
 
-    # Wait time: first 30 min free, then 15-min increments
     wait_charge = 0.0
     if wait_minutes > 30:
         increments = math.ceil((wait_minutes - 30) / 15)
         wait_charge = (WAIT_RATE_HR / 4.0) * increments
         acc += wait_charge
 
-    # Fuelable: base + OOA + Direct Drive flat
     dd_flat = ACCESSORIALS["Direct Drive (flat)"] if flags.get("Direct Drive (flat)", False) else 0.0
     fuelable = base + ooa_charge + dd_flat
 
@@ -94,6 +91,10 @@ def calculate(
         "Fuel amount":             round(fuel_amt, 2),
         "Grand Total":             round(total, 2),
     }
+
+# ---------------------- SESSION LOG ----------------------
+if "log" not in st.session_state:
+    st.session_state.log = []
 
 # ---------------------- UI ----------------------
 st.title("📦 CEVA / NovaXpress Tariff Calculator")
@@ -126,11 +127,11 @@ st.markdown("---")
 st.caption("Accessorials — toggle as needed")
 c1, c2 = st.columns(2)
 
-tailgate_default = weight_lbs > 200 and not False  # pre-white-glove; white_glove not yet read
+white_glove_default = False  # read below; used to suppress auto-applies
 
 with c1:
-    two_man      = st.toggle("2 Man Service ($25)",                                       value=False)
-    tailgate     = st.toggle("Tailgate over 200 lbs ($15)",                      value=(weight_lbs > 200))
+    two_man      = st.toggle("2 Man Service ($25)",                                       value=(weight_lbs > 70))
+    tailgate     = st.toggle("Tailgate over 200 lbs ($15)",                               value=(weight_lbs > 200))
     inside       = st.toggle("Inside Delivery ($25)",                                     value=False)
 
 with c2:
@@ -149,10 +150,14 @@ st.caption("Enter the current FCA rate provided by CEVA. Set to 0 if not applica
 fuel_pct_input = st.number_input("Fuel Surcharge % (e.g. 12 for 12%)", min_value=0.0, value=0.0, step=0.5)
 
 if st.button("Calculate", type="primary"):
+    # If White Glove is on it covers 2-man and tailgate — suppress them
+    effective_two_man  = False if white_glove else two_man
+    effective_tailgate = False if white_glove else tailgate
+
     flags = {
-        "2 Man Service":             two_man,
-        "Tailgate (over 200 lbs)":   tailgate,
-        "Inside Delivery":           inside,
+        "2 Man Service":             effective_two_man,
+        "Tailgate (over 200 lbs)":   effective_tailgate,
+        "Inside Delivery":           False if white_glove else inside,
         "White Glove (residential)": white_glove,
         "Skid Handbomb (lumper)":    handbomb,
         "Direct Drive (flat)":       direct_drive,
@@ -200,5 +205,53 @@ if st.button("Calculate", type="primary"):
             ],
         })
         st.dataframe(df, use_container_width=True)
-
         st.success(f"**Grand Total: ${res['Grand Total']:,.2f}**")
+
+        # Append to session log
+        st.session_state.log.append({
+            "Timestamp":              datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Distance (km)":          distance_km,
+            "Weight (lbs)":           weight_lbs,
+            "Zone":                   res["Zone"],
+            "Weight Bracket":         res["Weight Bracket"],
+            "Rate per lb":            res["Rate per lb"],
+            "OOA Type":               ooa_type if is_ooa else "N/A",
+            "OOA KM":                 ooa_km if is_ooa else 0,
+            "2 Man":                  effective_two_man,
+            "Tailgate":               effective_tailgate,
+            "Inside Delivery":        flags["Inside Delivery"],
+            "White Glove":            white_glove,
+            "Handbomb":               handbomb,
+            "Direct Drive":           direct_drive,
+            "Wait Time (min)":        wait_minutes,
+            "Fuel % (FCA)":           f'{fuel_pct_input:.1f}%',
+            "Base LTL ($)":           res["Base LTL"],
+            "OOA Charge ($)":         res["OOA charge"],
+            "Accessorials ($)":       res["Accessorials (non-fuel)"],
+            "Wait Time Charge ($)":   res["Wait Time charge"],
+            "Fuel Amount ($)":        res["Fuel amount"],
+            "Grand Total ($)":        res["Grand Total"],
+        })
+
+# ---------------------- EXPORT ----------------------
+if st.session_state.log:
+    st.markdown("---")
+    st.subheader("Session Log")
+    log_df = pd.DataFrame(st.session_state.log)
+    st.dataframe(log_df, use_container_width=True)
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        log_df.to_excel(writer, index=False, sheet_name="Calculations")
+    buf.seek(0)
+
+    st.download_button(
+        label="⬇️ Download as Excel",
+        data=buf,
+        file_name=f"nova_xpress_calculations_{date.today().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    if st.button("Clear log"):
+        st.session_state.log = []
+        st.rerun()
