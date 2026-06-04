@@ -109,6 +109,27 @@ def parse_waybill_page(text: str) -> dict:
     return result
 
 
+def decode_barcode_from_page(page) -> str:
+    """
+    Try to decode a barcode from a pdfplumber page object.
+    Returns barcode string or empty string if nothing found.
+    Tries 200 dpi first, 300 dpi as fallback.
+    """
+    try:
+        from pyzbar import pyzbar
+    except ImportError:
+        return ""
+    for dpi in (200, 300):
+        try:
+            img      = page.to_image(resolution=dpi).original
+            barcodes = pyzbar.decode(img)
+            if barcodes:
+                return barcodes[0].data.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            continue
+    return ""
+
+
 def parse_waybill(pdf_bytes: bytes) -> dict:
     """Parse single waybill PDF — reads first page only."""
     try:
@@ -117,10 +138,19 @@ def parse_waybill(pdf_bytes: bytes) -> dict:
         return {"error": "pdfplumber not installed — add to requirements.txt"}
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            text = pdf.pages[0].extract_text() or ""
+            page = pdf.pages[0]
+            text = page.extract_text() or ""
+            # Barcode takes priority over text regex for DG number
+            barcode_val = decode_barcode_from_page(page)
     except Exception as e:
         return {"error": f"Could not read PDF: {e}"}
-    return parse_waybill_page(text)
+    result = parse_waybill_page(text)
+    if barcode_val:
+        result["dg_number"]    = barcode_val
+        result["barcode_read"] = True
+    else:
+        result["barcode_read"] = False
+    return result
 
 
 def parse_waybill_batch(pdf_bytes: bytes) -> list:
@@ -140,11 +170,25 @@ def parse_waybill_batch(pdf_bytes: bytes) -> list:
         return [{"error": f"Could not read PDF: {e}"}]
 
     seen_dg   = set()
-    seen_ref  = set()
     results   = []
 
-    for text in pages_text:
-        parsed = parse_waybill_page(text)
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf2:
+            pages_objs = list(pdf2.pages)
+    except Exception:
+        pages_objs = [None] * len(pages_text)
+
+    for i, text in enumerate(pages_text):
+        parsed      = parse_waybill_page(text)
+        # Try barcode decode for this page
+        page_obj    = pages_objs[i] if i < len(pages_objs) else None
+        barcode_val = decode_barcode_from_page(page_obj) if page_obj else ""
+        if barcode_val:
+            parsed["dg_number"]    = barcode_val
+            parsed["barcode_read"] = True
+        else:
+            parsed["barcode_read"] = False
+
         if not parsed["dg_number"] and not parsed["ref_no"]:
             continue  # blank / template page
         # Deduplicate: skip if we've seen this DG or ref already
