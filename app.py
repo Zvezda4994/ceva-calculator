@@ -51,6 +51,7 @@ def parse_waybill(pdf_bytes: bytes) -> dict:
         "consignee_address": "",
         "weight_lbs":        0.0,
         "ref_no":            "",
+        "dg_number":         "",
         "parse_notes":       [],
     }
 
@@ -76,6 +77,13 @@ def parse_waybill(pdf_bytes: bytes) -> dict:
         result["weight_lbs"] = round(val, 3)
     else:
         result["parse_notes"].append("Weight not found — enter manually.")
+
+    # --- DG Number (barcode ref, top right) ---
+    dg_match = re.search(r'(DG\d{3}-\d{7}|GD\d{3}-\d{7})', text)
+    if dg_match:
+        result["dg_number"] = dg_match.group(1).strip()
+    else:
+        result["dg_number"] = ""
 
     # --- House/Ref # ---
     ref_match = re.search(r'(?:House/Ref\s*#[:\s]+|NLS|AZN|DVB|DLF|DY4|CTM[TV]|VFB|VGB|VTO|WAW|ZH)([A-Z0-9\-]+)', text)
@@ -171,6 +179,7 @@ if "log"            not in st.session_state: st.session_state.log            = [
 if "pdf_weight"     not in st.session_state: st.session_state.pdf_weight     = 0.0
 if "pdf_consignee"  not in st.session_state: st.session_state.pdf_consignee  = ""
 if "pdf_ref"        not in st.session_state: st.session_state.pdf_ref        = ""
+if "pdf_dg"         not in st.session_state: st.session_state.pdf_dg         = ""
 if "pdf_parsed"     not in st.session_state: st.session_state.pdf_parsed     = False
 
 # ---------------------- UI ----------------------
@@ -202,12 +211,14 @@ if uploaded is not None:
         st.session_state.pdf_weight    = parsed["weight_lbs"]
         st.session_state.pdf_consignee = f'{parsed["consignee_name"]}  |  {parsed["consignee_address"]}'.strip(" |")
         st.session_state.pdf_ref       = parsed["ref_no"]
+        st.session_state.pdf_dg        = parsed["dg_number"]
         st.session_state.pdf_parsed    = True
 
-        cols = st.columns(3)
+        cols = st.columns(4)
         cols[0].metric("Weight extracted", f'{parsed["weight_lbs"]:.3f} lbs')
-        cols[1].metric("Ref #", parsed["ref_no"] or "—")
-        cols[2].metric("Consignee", parsed["consignee_name"] or "—")
+        cols[1].metric("DG #", parsed["dg_number"] or "—")
+        cols[2].metric("Ref #", parsed["ref_no"] or "—")
+        cols[3].metric("Consignee", parsed["consignee_name"] or "—")
 
         if parsed["consignee_address"]:
             st.caption(f"📍 {parsed['consignee_address']}")
@@ -222,6 +233,7 @@ st.subheader("Shipment Details")
 # Pre-fill weight from PDF if available, otherwise 0
 default_weight = st.session_state.pdf_weight if st.session_state.pdf_parsed else 0.0
 default_ref    = st.session_state.pdf_ref    if st.session_state.pdf_parsed else ""
+default_dg     = st.session_state.pdf_dg     if st.session_state.pdf_parsed else ""
 
 col1, col2 = st.columns(2)
 
@@ -231,6 +243,7 @@ with col1:
 
 with col2:
     ref_number = st.text_input("Reference / Job #", value=default_ref, placeholder="e.g. NLS1268763")
+    dg_number  = st.text_input("DG # (barcode ref)",  value=default_dg,  placeholder="e.g. DG104-1615184")
     is_ooa   = st.selectbox("Is Out-of-Area?", ["No", "Yes"], index=0) == "Yes"
     ooa_type = st.selectbox("Out-of-Area Type", list(OOA_RATE.keys()), index=0, disabled=not is_ooa)
     ooa_km   = st.number_input("Out-of-Area KM", min_value=0.0, value=0.0, step=1.0, disabled=not is_ooa)
@@ -324,6 +337,7 @@ if st.button("Calculate", type="primary"):
         st.session_state.log.append({
             "Timestamp":              datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "Ref #":                  ref_number,
+            "DG #":                   dg_number,
             "Consignee":              st.session_state.pdf_consignee,
             "Distance (km)":          distance_km,
             "Weight (lbs)":           weight_lbs,
@@ -353,6 +367,7 @@ if st.button("Calculate", type="primary"):
         st.session_state.pdf_weight    = 0.0
         st.session_state.pdf_consignee = ""
         st.session_state.pdf_ref       = ""
+        st.session_state.pdf_dg        = ""
 
 # ---------------------- EXPORT ----------------------
 if st.session_state.log:
