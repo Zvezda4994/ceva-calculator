@@ -36,11 +36,40 @@ ACCESSORIALS = {
 WAIT_RATE_HR = 60.0
 
 # ---------------------- PDF PARSER ----------------------
+def extract_address_block(lines: list, start_label: str, stop_words: set) -> list:
+    """
+    Generic block extractor — finds start_label in lines then collects
+    address lines until a stop word is hit. Returns list of clean lines.
+    """
+    result_lines = []
+    in_block     = False
+    for line in lines:
+        low = line.lower()
+        if start_label in low:
+            in_block = True
+            continue
+        if in_block:
+            if any(sw in low for sw in stop_words):
+                break
+            if len(line) < 3:
+                continue
+            if re.match(r'^\d{10,}$', line):
+                continue
+            if line.endswith("..."):
+                continue
+            result_lines.append(line)
+    return result_lines
+
+
 def parse_waybill_page(text: str) -> dict:
     """Parse extracted text from one waybill page. Returns parsed fields dict."""
     result = {
         "consignee_name":    "",
         "consignee_address": "",
+        "shipper_name":      "",
+        "shipper_address":   "",
+        "is_pickup":         False,
+        "routing_address":   "",   # address to use for distance routing
         "weight_lbs":        0.0,
         "ref_no":            "",
         "dg_number":         "",
@@ -49,7 +78,10 @@ def parse_waybill_page(text: str) -> dict:
 
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    # --- Weight (decimal lbs or kgs) ---
+    # --- Detect pickup vs delivery ---
+    result["is_pickup"] = bool(re.search(r'\(PICKUP\)', text, re.IGNORECASE))
+
+    # --- Weight ---
     weight_match = re.search(r'(\d+\.?\d*)\s*(Lbs|Kgs|lbs|kgs|LBS|KGS)', text)
     if weight_match:
         val  = float(weight_match.group(1))
@@ -61,50 +93,58 @@ def parse_waybill_page(text: str) -> dict:
     else:
         result["parse_notes"].append("Weight not found — enter manually.")
 
-    # --- DG Number (barcode ref top-right) ---
+    # --- DG Number ---
     dg_match = re.search(r'((?:DG|GD)\d{3}-\d{7})', text)
     if dg_match:
         result["dg_number"] = dg_match.group(1)
 
     # --- House/Ref # ---
     ref_match = re.search(
-        r'(?:House/Ref\s*#[:\s]+)([A-Z0-9\-]+)|'
-        r'\b(NLS\d+|AZN\d+|DVB\w+|DLF\w+|DY4\w+|CTM[TV]\d+|VFB\d+|VGB\d+|VTO\d+|WAW\d+|ZH\d+)\b',
+        r'(?:House/Ref\s*#[:\s]+)([A-Z0-9\-]{4,})|'
+        r'\b(NLS\d{4,}|AZN\d{4,}|DVB\w{4,}|DLF\w{4,}|DY4\w{4,}|CTM[TV]\d{4,}|VFB\d{4,}|VGB\d{4,}|VTO\d{4,}|WAW\d{4,}|ZH\d{4,})\b',
         text
     )
     if ref_match:
-        result["ref_no"] = (ref_match.group(1) or ref_match.group(2) or "").strip()
+        val = (ref_match.group(1) or ref_match.group(2) or "").strip()
+        # Reject single-char or suspiciously short matches
+        if len(val) >= 4:
+            result["ref_no"] = val
 
-    # --- Consignee block ---
-    consignee_lines = []
-    in_consignee    = False
-    stop_words      = {
+    # Shared stop words for both address blocks
+    stop_words = {
         "house/ref", "attn:", "pickup date", "service/de", "prepaid",
         "dangerous", "good desc", "billing party", "dimensions",
         "special inst", "references", "collect/port"
     }
 
-    for line in lines:
-        low = line.lower()
-        if "consignee / consignataire" in low or "consignee/consignataire" in low:
-            in_consignee = True
-            continue
-        if in_consignee:
-            if any(sw in low for sw in stop_words):
-                break
-            if "shipper" in low or "expéditeur" in low:
-                break
-            if len(line) < 3:
-                continue
-            if re.match(r'^\d{10,}$', line):  # bare account numbers
-                continue
-            consignee_lines.append(line)
-
+    # --- Consignee block ---
+    consignee_lines = extract_address_block(
+        lines,
+        start_label="consignee / consignataire",
+        stop_words=stop_words | {"shipper", "expéditeur"},
+    )
     if consignee_lines:
         result["consignee_name"]    = consignee_lines[0]
         result["consignee_address"] = ", ".join(consignee_lines[1:]) if len(consignee_lines) > 1 else ""
     else:
         result["parse_notes"].append("Consignee not found — enter manually.")
+
+    # --- Shipper block (needed for pickup jobs) ---
+    shipper_lines = extract_address_block(
+        lines,
+        start_label="shipper / expéditeur",
+        stop_words=stop_words | {"consignee", "consignataire"},
+    )
+    if shipper_lines:
+        result["shipper_name"]    = shipper_lines[0]
+        result["shipper_address"] = ", ".join(shipper_lines[1:]) if len(shipper_lines) > 1 else ""
+
+    # --- Routing address: shipper for pickups, consignee for deliveries ---
+    if result["is_pickup"]:
+        result["routing_address"] = f'{result["shipper_name"]} {result["shipper_address"]}'.strip()
+        result["parse_notes"].append("Pickup detected — routing to shipper address.")
+    else:
+        result["routing_address"] = f'{result["consignee_name"]} {result["consignee_address"]}'.strip()
 
     return result
 
@@ -189,10 +229,11 @@ def parse_waybill_batch(pdf_bytes: bytes) -> list:
         else:
             parsed["barcode_read"] = False
 
-        if not parsed["dg_number"] and not parsed["ref_no"]:
-            continue  # blank / template page
-        # Deduplicate: skip if we've seen this DG or ref already
         key = parsed["dg_number"] or parsed["ref_no"]
+        # Skip blank/template pages — no valid identifier
+        if not key or len(key) < 4:
+            continue
+        # Deduplicate: skip if we've seen this DG or ref already
         if key in seen_dg:
             continue
         seen_dg.add(key)
@@ -253,18 +294,18 @@ def calculate(distance_km, weight_lbs, is_ooa, ooa_type, ooa_km, flags, wait_min
 
 # ---------------------- SESSION STATE ----------------------
 defaults = {
-    "log":           [],
-    "pdf_weight":    0.0,
-    "pdf_consignee": "",
-    "pdf_ref":       "",
-    "pdf_dg":        "",
-    "pdf_parsed":    False,
-    "last_file_id":  None,   # track uploaded file to prevent re-parse on rerun
-    "fca_pct":       0.0,    # persists FCA within session
+    "log":            [],
+    "pdf_weight":     0.0,
+    "pdf_consignee":  "",
+    "pdf_ref":        "",
+    "pdf_dg":         "",
+    "pdf_parsed":     False,
+    "last_file_id":   None,
+    "fca_pct":        0.0,
     # Batch queue
-    "batch_queue":   [],     # list of parsed waybill dicts
-    "batch_idx":     0,      # current position in queue
-    "batch_mode":    False,
+    "batch_queue":    [],
+    "batch_idx":      0,
+    "batch_mode":     False,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -330,6 +371,7 @@ if uploaded is not None:
                 st.session_state.pdf_ref       = parsed["ref_no"]
                 st.session_state.pdf_dg        = parsed["dg_number"]
                 st.session_state.pdf_parsed    = True
+
                 if parsed["parse_notes"]:
                     for note in parsed["parse_notes"]:
                         st.warning(f"⚠️ {note}")
@@ -369,6 +411,7 @@ if st.session_state.pdf_parsed:
         parts = st.session_state.pdf_consignee.split("|")
         if len(parts) > 1:
             st.caption(f"📍 {parts[1].strip()}")
+
 
 # ---------------------- UI — SHIPMENT DETAILS ----------------------
 st.markdown("---")
@@ -535,6 +578,7 @@ if st.button("Calculate", type="primary"):
         st.session_state.pdf_consignee = ""
         st.session_state.pdf_ref       = ""
         st.session_state.pdf_dg        = ""
+
 
         st.rerun()
 
