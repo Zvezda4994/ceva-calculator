@@ -4,6 +4,112 @@ import re
 from datetime import date, datetime
 import pandas as pd
 import streamlit as st
+import time
+import requests
+
+# ---------------------- CSV MANIFEST INGESTION + DISTANCE CALC ----------------------
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OSRM_URL      = "https://router.project-osrm.org/route/v1/driving"
+NOMINATIM_HEADERS = {"User-Agent": "VAREK-CEVA-Calculator/1.0 (personal use)"}
+
+def geocode_address(address1, city, state, zipcode):
+    query = f"{address1}, {city}, {state}, {zipcode}, Canada"
+    try:
+        resp = requests.get(
+            NOMINATIM_URL,
+            params={"q": query, "format": "json", "limit": 1, "countrycodes": "ca"},
+            headers=NOMINATIM_HEADERS, timeout=8,
+        )
+        resp.raise_for_status()
+        results = resp.json()
+        if results:
+            return (float(results[0]["lat"]), float(results[0]["lon"]))
+    except Exception:
+        pass
+    return None
+
+def geocode_cached(address1, city, state, zipcode, cache):
+    key = f"{address1}|{city}|{state}|{zipcode}".upper().strip()
+    if key in cache:
+        return cache[key]
+    time.sleep(1.0)  # Nominatim usage policy: ~1 req/sec
+    result = geocode_address(address1, city, state, zipcode)
+    cache[key] = result
+    return result
+
+def driving_distance_km(origin, dest):
+    if not origin or not dest:
+        return None
+    try:
+        lat1, lon1 = origin
+        lat2, lon2 = dest
+        url = f"{OSRM_URL}/{lon1},{lat1};{lon2},{lat2}"
+        resp = requests.get(url, params={"overview": "false"}, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") == "Ok" and data.get("routes"):
+            return round(data["routes"][0]["distance"] / 1000.0, 1)
+    except Exception:
+        pass
+    return None
+
+REMARKS_ACCESSORIAL_HINTS = {
+    "2 Man Service":             ["2 MAN", "2-MAN", "TWO MAN"],
+    "Tailgate (over 200 lbs)":   ["LIFTGATE", "TAILGATE", "TG REQ"],
+    "Inside Delivery":           ["INSIDE DELIVERY", "ROOM OF CHOICE"],
+    "White Glove (residential)": ["WHITE GLOVE", "WGD"],
+    "Skid Handbomb (lumper)":    ["HANDBOMB", "LUMPER"],
+}
+
+def suggest_accessorials_from_remarks(remarks):
+    remarks_upper = (remarks or "").upper()
+    return {k: any(kw in remarks_upper for kw in kws) for k, kws in REMARKS_ACCESSORIAL_HINTS.items()}
+
+def parse_manifest_csv(csv_bytes):
+    """Parse a CEVA manifest CSV export into the same waybill-dict shape the
+    PDF batch parser produces, so the batch UI / review flags work unchanged.
+    NOTE: uses Chargeable Weight (lbs) — confirm with CEVA this is the billed weight."""
+    required = ["Booking Number", "Chargeable Weight (lbs)",
+                "Shipper Address 1", "Shipper City", "Shipper State", "Shipper Zipcode",
+                "Consignee Name", "Consignee Address 1", "Consignee City",
+                "Consignee State", "Consignee Zipcode"]
+    try:
+        df = pd.read_csv(io.BytesIO(csv_bytes))
+    except Exception:
+        df = pd.read_excel(io.BytesIO(csv_bytes))
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        return [{"error": f"CSV is missing expected column(s): {', '.join(missing)}"}]
+
+    results = []
+    for _, row in df.iterrows():
+        remarks = str(row.get("Remarks", "") or "")
+        weight = float(row.get("Chargeable Weight (lbs)", 0) or 0)
+        cons_addr1 = str(row.get("Consignee Address 1", "")).strip()
+        results.append({
+            "dg_number":          str(row.get("Booking Number", "")).strip(),
+            "ref_no":             str(row.get("Housebill", "")).strip(),
+            "weight_lbs":         weight,
+            "shipper_name":       str(row.get("Shipper Name", "")).strip(),
+            "shipper_address1":   str(row.get("Shipper Address 1", "")).strip(),
+            "shipper_city":       str(row.get("Shipper City", "")).strip(),
+            "shipper_state":      str(row.get("Shipper State", "")).strip(),
+            "shipper_zip":        str(row.get("Shipper Zipcode", "")).strip(),
+            "consignee_name":     str(row.get("Consignee Name", "")).strip(),
+            "consignee_address1": cons_addr1,
+            "consignee_city":     str(row.get("Consignee City", "")).strip(),
+            "consignee_state":    str(row.get("Consignee State", "")).strip(),
+            "consignee_zip":      str(row.get("Consignee Zipcode", "")).strip(),
+            "consignee_address":  f'{cons_addr1}, {row.get("Consignee City","")}, {row.get("Consignee State","")} {row.get("Consignee Zipcode","")}',
+            "remarks":            remarks,
+            "item_description":   str(row.get("Item Description", "")).strip(),
+            "service_level":      str(row.get("Service Level", "")).strip(),
+            "suggested_accessorials": suggest_accessorials_from_remarks(remarks),
+            "needs_review": (weight <= 0 or not cons_addr1),
+            "parse_notes": [],
+        })
+    return results
+
 
 st.set_page_config(page_title="CEVA / NovaXpress Tariff Calculator", page_icon="📦", layout="centered")
 
@@ -37,10 +143,6 @@ WAIT_RATE_HR = 60.0
 
 # ---------------------- PDF PARSER ----------------------
 def extract_address_block(lines: list, start_label: str, stop_words: set) -> list:
-    """
-    Generic block extractor — finds start_label in lines then collects
-    address lines until a stop word is hit. Returns list of clean lines.
-    """
     result_lines = []
     in_block     = False
     for line in lines:
@@ -62,10 +164,6 @@ def extract_address_block(lines: list, start_label: str, stop_words: set) -> lis
 
 
 def extract_consignee_from_page(page) -> list:
-    """
-    Extract consignee address lines using bounding box crop.
-    Returns list of clean address lines.
-    """
     try:
         w, h  = page.width, page.height
         crop  = page.crop((w * 0.35, h * 0.08, w * 0.65, h * 0.40))
@@ -84,11 +182,8 @@ def extract_consignee_from_page(page) -> list:
                 break
             if len(line) < 3 or re.match(r"^\d{7,}$", line):
                 continue
-            # Strip trailing merged columns (3+ spaces = new column)
             line = re.split(r"\s{3,}", line)[0].strip()
-            # Clean trailing truncation dots from names (keep the name)
             line = re.sub(r"\.{2,}$", "", line).strip()
-            # Skip known noise tokens
             if line in ("NOVA", "YOW", "YUL", "YYZ", "ECO", "APT", "THD", "WGD"):
                 continue
             if len(line) < 3:
@@ -101,10 +196,6 @@ def extract_consignee_from_page(page) -> list:
 
 
 def extract_shipper_from_page(page) -> list:
-    """
-    Extract shipper address lines using bounding box crop (left column).
-    Returns list of clean address lines.
-    """
     try:
         w, h  = page.width, page.height
         crop  = page.crop((0, h * 0.08, w * 0.35, h * 0.40))
@@ -145,7 +236,7 @@ def parse_waybill_page(text: str, page=None) -> dict:
         "shipper_name":      "",
         "shipper_address":   "",
         "is_pickup":         False,
-        "routing_address":   "",   # address to use for distance routing
+        "routing_address":   "",
         "weight_lbs":        0.0,
         "ref_no":            "",
         "dg_number":         "",
@@ -154,10 +245,8 @@ def parse_waybill_page(text: str, page=None) -> dict:
 
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    # --- Detect pickup vs delivery ---
     result["is_pickup"] = bool(re.search(r'\(PICKUP\)', text, re.IGNORECASE))
 
-    # --- Weight ---
     weight_match = re.search(r'(\d+\.?\d*)\s*(Lbs|Kgs|lbs|kgs|LBS|KGS)', text)
     if weight_match:
         val  = float(weight_match.group(1))
@@ -169,12 +258,10 @@ def parse_waybill_page(text: str, page=None) -> dict:
     else:
         result["parse_notes"].append("weight_missing")
 
-    # --- DG Number ---
     dg_match = re.search(r'((?:DG|GD)\d{3}-\d{7})', text)
     if dg_match:
         result["dg_number"] = dg_match.group(1)
 
-    # --- House/Ref # ---
     ref_match = re.search(
         r'(?:House/Ref\s*#[:\s]+)([A-Z0-9\-]{4,})|'
         r'\b(NLS\d{4,}|AZN\d{4,}|DVB\w{4,}|DLF\w{4,}|DY4\w{4,}|CTM[TV]\d{4,}|VFB\d{4,}|VGB\d{4,}|VTO\d{4,}|WAW\d{4,}|ZH\d{4,})\b',
@@ -182,11 +269,9 @@ def parse_waybill_page(text: str, page=None) -> dict:
     )
     if ref_match:
         val = (ref_match.group(1) or ref_match.group(2) or "").strip()
-        # Reject single-char or suspiciously short matches
         if len(val) >= 4:
             result["ref_no"] = val
 
-    # --- Consignee block — crop-based if page object available, text fallback ---
     if page is not None:
         consignee_lines = extract_consignee_from_page(page)
     else:
@@ -203,8 +288,9 @@ def parse_waybill_page(text: str, page=None) -> dict:
     if consignee_lines:
         result["consignee_name"]    = consignee_lines[0]
         result["consignee_address"] = ", ".join(consignee_lines[1:]) if len(consignee_lines) > 1 else ""
+    else:
+        result["parse_notes"].append("consignee_missing")
 
-    # --- Shipper block — crop-based if page object available ---
     if page is not None:
         shipper_lines = extract_shipper_from_page(page)
     else:
@@ -221,22 +307,25 @@ def parse_waybill_page(text: str, page=None) -> dict:
     if shipper_lines:
         result["shipper_name"]    = shipper_lines[0]
         result["shipper_address"] = ", ".join(shipper_lines[1:]) if len(shipper_lines) > 1 else ""
+    else:
+        result["parse_notes"].append("shipper_missing")
 
-    # --- Routing address: shipper for pickups, consignee for deliveries ---
     if result["is_pickup"]:
         result["routing_address"] = f'{result["shipper_name"]} {result["shipper_address"]}'.strip()
     else:
         result["routing_address"] = f'{result["consignee_name"]} {result["consignee_address"]}'.strip()
 
+    # NEW: overall confidence flag — anything downstream (UI, batch queue) can
+    # check this instead of re-deriving "is this row trustworthy" logic itself.
+    result["needs_review"] = bool(
+        set(result["parse_notes"]) & {"weight_missing", "consignee_missing", "shipper_missing"}
+        or not result["dg_number"]
+    )
+
     return result
 
 
 def decode_barcode_from_page(page) -> str:
-    """
-    Try to decode a barcode from a pdfplumber page object.
-    Returns barcode string or empty string if nothing found.
-    Tries 200 dpi first, 300 dpi as fallback.
-    """
     try:
         from pyzbar import pyzbar
     except ImportError:
@@ -262,7 +351,6 @@ def parse_waybill(pdf_bytes: bytes) -> dict:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             page = pdf.pages[0]
             text = page.extract_text() or ""
-            # Barcode takes priority over text regex for DG number
             barcode_val = decode_barcode_from_page(page)
     except Exception as e:
         return {"error": f"Could not read PDF: {e}"}
@@ -272,14 +360,17 @@ def parse_waybill(pdf_bytes: bytes) -> dict:
         result["barcode_read"] = True
     else:
         result["barcode_read"] = False
+    result["needs_review"] = bool(
+        set(result["parse_notes"]) & {"weight_missing", "consignee_missing", "shipper_missing"}
+        or not result["dg_number"]
+    )
     return result
 
 
 def parse_waybill_batch(pdf_bytes: bytes) -> list:
     """
     Parse all waybills from a multi-page PDF.
-    Each unique DG number = one waybill. Deduplicates by DG #.
-    Returns list of parsed dicts.
+    Each unique DG number (or ref#, as fallback) = one waybill. Deduplicates.
     """
     try:
         import pdfplumber
@@ -291,8 +382,8 @@ def parse_waybill_batch(pdf_bytes: bytes) -> list:
     except Exception as e:
         return [{"error": f"Could not read PDF: {e}"}]
 
-    seen_dg   = set()
-    results   = []
+    seen_dg = set()
+    results = []
 
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf2:
@@ -301,9 +392,15 @@ def parse_waybill_batch(pdf_bytes: bytes) -> list:
         pages_objs = [None] * len(pages_text)
 
     for i, text in enumerate(pages_text):
-        parsed      = parse_waybill_page(text, page=page_obj)
-        # Try barcode decode for this page
-        page_obj    = pages_objs[i] if i < len(pages_objs) else None
+        # FIX: page_obj must be resolved BEFORE it's used to parse this page.
+        # Previously this line came *after* parse_waybill_page(..., page=page_obj),
+        # which meant every waybill in a batch was parsed against the page object
+        # left over from the PREVIOUS loop iteration (a NameError on the very
+        # first page, and an off-by-one page mismatch on every page after that).
+        page_obj = pages_objs[i] if i < len(pages_objs) else None
+
+        parsed = parse_waybill_page(text, page=page_obj)
+
         barcode_val = decode_barcode_from_page(page_obj) if page_obj else ""
         if barcode_val:
             parsed["dg_number"]    = barcode_val
@@ -311,14 +408,21 @@ def parse_waybill_batch(pdf_bytes: bytes) -> list:
         else:
             parsed["barcode_read"] = False
 
+        parsed["source_page"] = i + 1  # for traceability if something looks wrong
+
         key = parsed["dg_number"] or parsed["ref_no"]
-        # Skip blank/template pages — no valid identifier
+        # Skip blank/template pages — no valid identifier (e.g. routing stickers)
         if not key or len(key) < 4:
             continue
-        # Deduplicate: skip if we've seen this DG or ref already
         if key in seen_dg:
             continue
         seen_dg.add(key)
+
+        parsed["needs_review"] = bool(
+            set(parsed["parse_notes"]) & {"weight_missing", "consignee_missing", "shipper_missing"}
+            or not parsed["dg_number"]
+        )
+
         results.append(parsed)
 
     return results
@@ -384,10 +488,19 @@ defaults = {
     "pdf_parsed":     False,
     "last_file_id":   None,
     "fca_pct":        0.0,
-    # Batch queue
     "batch_queue":    [],
     "batch_idx":      0,
     "batch_mode":     False,
+    # NEW: CSV manifest ingestion path (separate queue from the PDF batch queue,
+    # since a CSV row and a parsed PDF page carry slightly different fields)
+    "csv_queue":      [],
+    "csv_idx":        0,
+    "csv_mode":       False,
+    "geocode_cache":  {},
+    "csv_last_file_id": None,
+    "csv_original_df": None,   # NEW: raw manifest, kept as-is so we can output it augmented
+    "csv_results_by_idx": {},  # NEW: row index -> computed charge fields
+    "auto_distance_km": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -415,13 +528,11 @@ st.caption("Single waybill or full day batch PDF. Weight, DG #, ref # and consig
 uploaded = st.file_uploader("Upload waybill PDF", type=["pdf"], label_visibility="collapsed")
 
 if uploaded is not None:
-    # Use file id to avoid re-parsing on every Streamlit rerun
     file_id = (uploaded.name, uploaded.size)
     if file_id != st.session_state.last_file_id:
         st.session_state.last_file_id = file_id
         pdf_bytes = uploaded.read()
 
-        # Detect batch vs single based on page count
         try:
             import pdfplumber
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -430,7 +541,6 @@ if uploaded is not None:
             page_count = 1
 
         if page_count > 2:
-            # Batch mode
             results = parse_waybill_batch(pdf_bytes)
             if results and "error" in results[0]:
                 st.error(results[0]["error"])
@@ -439,9 +549,12 @@ if uploaded is not None:
                 st.session_state.batch_idx   = 0
                 st.session_state.batch_mode  = True
                 st.session_state.pdf_parsed  = False
-                st.success(f"📦 Found {len(results)} waybills. Working through them one by one.")
+                n_review = sum(1 for r in results if r.get("needs_review"))
+                msg = f"📦 Found {len(results)} waybills. Working through them one by one."
+                if n_review:
+                    msg += f" ⚠️ {n_review} flagged for review (missing weight/DG#/address)."
+                st.success(msg)
         else:
-            # Single mode
             parsed = parse_waybill(pdf_bytes)
             if "error" in parsed:
                 st.error(parsed["error"])
@@ -454,8 +567,8 @@ if uploaded is not None:
                 st.session_state.pdf_dg        = parsed["dg_number"]
                 st.session_state.pdf_parsed    = True
 
-                if "weight_missing" in parsed["parse_notes"]:
-                    st.info("📋 Weight not found in PDF — enter it below.")
+                if parsed.get("needs_review"):
+                    st.warning("⚠️ Some fields couldn't be confidently read from this PDF — double-check weight, DG#, and consignee below before calculating.")
                 for note in parsed["parse_notes"]:
                     if "kg" in note.lower():
                         st.info(f"ℹ️ {note}")
@@ -468,17 +581,19 @@ if st.session_state.batch_mode and st.session_state.batch_queue:
 
     if idx < total:
         current = queue[idx]
-        st.info(f"📋 Waybill {idx + 1} of {total} — {current['dg_number'] or current['ref_no']}")
+        label = f"📋 Waybill {idx + 1} of {total} — {current['dg_number'] or current['ref_no']}"
+        if current.get("needs_review"):
+            label += "  ⚠️ NEEDS REVIEW"
+        st.info(label)
 
-        # Load current waybill into single-mode fields
         st.session_state.pdf_weight    = current["weight_lbs"]
         st.session_state.pdf_consignee = f'{current["consignee_name"]}  |  {current["consignee_address"]}'.strip(" |")
         st.session_state.pdf_ref       = current["ref_no"]
         st.session_state.pdf_dg        = current["dg_number"]
         st.session_state.pdf_parsed    = True
 
-        if "weight_missing" in current.get("parse_notes", []):
-            st.info("📋 Weight not found in PDF — enter it below.")
+        if current.get("needs_review"):
+            st.warning("⚠️ This waybill had one or more fields that couldn't be confidently read — double-check weight, DG#, and consignee below before calculating.")
         if current.get("parse_notes") and any("kg" in n for n in current["parse_notes"]):
             for note in current["parse_notes"]:
                 if "kg" in note:
@@ -487,7 +602,122 @@ if st.session_state.batch_mode and st.session_state.batch_queue:
         st.success("✅ All waybills in this batch have been processed.")
         st.session_state.batch_mode = False
 
-# Show parsed metrics
+# ---------------------- UI — CSV MANIFEST UPLOAD ----------------------
+st.markdown("---")
+st.subheader("📊 Or Upload CEVA Manifest CSV")
+st.caption("If CEVA emailed a manifest CSV alongside the waybill PDFs, use that instead — structured columns, no parsing guesswork, and it powers automatic distance calculation below.")
+
+csv_uploaded = st.file_uploader("Upload manifest CSV", type=["csv", "xlsx"], label_visibility="collapsed", key="csv_uploader")
+
+if csv_uploaded is not None:
+    csv_file_id = (csv_uploaded.name, csv_uploaded.size)
+    if csv_file_id != st.session_state.csv_last_file_id:
+        st.session_state.csv_last_file_id = csv_file_id
+        csv_bytes = csv_uploaded.read()
+        csv_results = parse_manifest_csv(csv_bytes)
+        if csv_results and "error" in csv_results[0]:
+            st.error(csv_results[0]["error"])
+        else:
+            # keep the untouched original so the export mirrors their existing
+            # manifest format exactly, just with charge columns appended
+            try:
+                st.session_state.csv_original_df = pd.read_csv(io.BytesIO(csv_bytes))
+            except Exception:
+                st.session_state.csv_original_df = pd.read_excel(io.BytesIO(csv_bytes))
+            st.session_state.csv_results_by_idx = {}
+            st.session_state.csv_queue = csv_results
+            st.session_state.csv_idx   = 0
+            st.session_state.csv_mode  = True
+            st.session_state.pdf_parsed = False
+            st.session_state.batch_mode = False
+            n_review = sum(1 for r in csv_results if r.get("needs_review"))
+            msg = f"📊 Loaded {len(csv_results)} waybills from manifest."
+            if n_review:
+                msg += f" ⚠️ {n_review} flagged for review (missing weight or address)."
+            st.success(msg)
+
+if st.session_state.csv_queue:
+    queue = st.session_state.csv_queue
+    idx   = st.session_state.csv_idx
+    total = len(queue)
+
+    if idx < total:
+        current = queue[idx]
+        label = f"📊 Waybill {idx + 1} of {total} — {current['dg_number'] or current['ref_no']}"
+        if current.get("needs_review"):
+            label += "  ⚠️ NEEDS REVIEW"
+        st.info(label)
+        if current.get("needs_review"):
+            st.warning("⚠️ Missing weight or consignee address on this row — double-check before calculating.")
+
+        st.session_state.pdf_weight    = current["weight_lbs"]
+        st.session_state.pdf_consignee = f'{current["consignee_name"]}  |  {current["consignee_address"]}'.strip(" |")
+        st.session_state.pdf_ref       = current["ref_no"]
+        st.session_state.pdf_dg        = current["dg_number"]
+        st.session_state.pdf_parsed    = True
+
+        st.caption(f"📦 {current.get('item_description','')}  ·  Service: {current.get('service_level','—')}")
+        if current.get("remarks"):
+            st.caption(f"📝 {current['remarks']}")
+
+        col_a, col_b = st.columns([1, 1])
+        with col_a:
+            if st.button("📍 Auto-calculate distance", key=f"dist_{idx}"):
+                with st.spinner("Geocoding addresses and routing..."):
+                    origin = geocode_cached(
+                        current["shipper_address1"], current["shipper_city"],
+                        current["shipper_state"], current["shipper_zip"],
+                        st.session_state.geocode_cache,
+                    )
+                    dest = geocode_cached(
+                        current["consignee_address1"], current["consignee_city"],
+                        current["consignee_state"], current["consignee_zip"],
+                        st.session_state.geocode_cache,
+                    )
+                    dist = driving_distance_km(origin, dest)
+                    if dist is not None:
+                        st.session_state.auto_distance_km = dist
+                        st.success(f"Estimated driving distance: {dist} km — always spot-check this against the zone before billing.")
+                    else:
+                        st.session_state.auto_distance_km = None
+                        st.error("Couldn't geocode one or both addresses — enter distance manually.")
+        with col_b:
+            suggested = [k for k, v in current.get("suggested_accessorials", {}).items() if v]
+            if suggested:
+                st.caption("💡 Remarks suggest: " + ", ".join(suggested) + " — verify before applying.")
+    else:
+        st.success("✅ All waybills in this manifest have been processed.")
+        st.session_state.csv_mode = False
+
+    # NEW: export the ORIGINAL manifest with two columns appended — this is
+    # the format they actually asked for, not a separate log/report.
+    if st.session_state.csv_original_df is not None:
+        n_done = len(st.session_state.csv_results_by_idx)
+        st.caption(f"{n_done} of {len(queue)} waybills calculated so far.")
+        out_df = st.session_state.csv_original_df.copy()
+
+        breakdown_columns = [
+            "Distance (km)", "Zone", "Weight Bracket",
+            "Base LTL ($)", "OOA Charge ($)", "Accessorials ($)",
+            "Wait Time Charge ($)", "Fuel Amount ($)", "Grand Total ($)",
+        ]
+        for col in breakdown_columns:
+            out_df[col] = out_df.index.map(
+                lambda i, col=col: st.session_state.csv_results_by_idx.get(i, {}).get(col)
+            )
+
+        csv_buf = io.BytesIO()
+        out_df.to_csv(csv_buf, index=False)
+        csv_buf.seek(0)
+        st.download_button(
+            label="⬇️ Download manifest with totals",
+            data=csv_buf,
+            file_name=f"manifest_with_totals_{date.today().isoformat()}.csv",
+            mime="text/csv",
+        )
+        if n_done < len(queue):
+            st.caption("Rows not yet calculated will be blank in the download — you can download partway through and again at the end.")
+
 if st.session_state.pdf_parsed:
     cols = st.columns(4)
     cols[0].metric("Weight", f'{st.session_state.pdf_weight:.3f} lbs')
@@ -511,7 +741,10 @@ default_dg     = st.session_state.pdf_dg     if st.session_state.pdf_parsed else
 col1, col2 = st.columns(2)
 
 with col1:
-    distance_km = st.number_input("Distance (km)", min_value=0.0, max_value=500.0, value=0.0, step=1.0)
+    default_distance = st.session_state.auto_distance_km if st.session_state.auto_distance_km is not None else 0.0
+    distance_km = st.number_input("Distance (km)", min_value=0.0, max_value=500.0, value=default_distance, step=1.0)
+    if st.session_state.auto_distance_km is not None:
+        st.caption("📍 Auto-calculated — double-check against the zone map before billing.")
     weight_lbs  = st.number_input("Weight (lbs)",  min_value=0.0, value=default_weight, step=0.1)
 
 with col2:
@@ -524,7 +757,6 @@ with col2:
 if st.session_state.pdf_consignee:
     st.caption(f"🚚 Consignee: {st.session_state.pdf_consignee}")
 
-# Input validation warnings (non-blocking)
 if distance_km == 0:
     st.warning("⚠️ Distance is 0 km — enter the delivery distance before calculating.")
 if weight_lbs == 0:
@@ -552,17 +784,15 @@ wait_minutes = st.number_input(
 st.markdown("---")
 st.subheader("Fuel Surcharge (FCA)")
 st.caption("Enter the current FCA rate provided by CEVA. Set to 0 if not applicable.")
-# FCA persists in session so he doesn't re-enter it every waybill
 fuel_pct_input = st.number_input(
     "Fuel Surcharge % (e.g. 12 for 12%)",
     min_value=0.0,
     value=st.session_state.fca_pct,
     step=0.5
 )
-st.session_state.fca_pct = fuel_pct_input  # persist for next waybill
+st.session_state.fca_pct = fuel_pct_input
 
 if st.button("Calculate", type="primary"):
-    # Block on missing critical inputs
     if distance_km == 0:
         st.error("Enter the distance (km) before calculating.")
         st.stop()
@@ -626,7 +856,6 @@ if st.button("Calculate", type="primary"):
         st.dataframe(df, use_container_width=True)
         st.success(f"**Grand Total: ${res['Grand Total']:,.2f}**")
 
-        # Log
         st.session_state.log.append({
             "Timestamp":            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "DG #":                 dg_number,
@@ -655,17 +884,31 @@ if st.button("Calculate", type="primary"):
             "Grand Total ($)":      res["Grand Total"],
         })
 
-        # Advance batch queue after logging
+        if st.session_state.csv_mode:
+            # capture against the CURRENT row before we advance the index
+            st.session_state.csv_results_by_idx[st.session_state.csv_idx] = {
+                "Distance (km)":          distance_km,
+                "Zone":                   res["Zone"],
+                "Weight Bracket":         res["Weight Bracket"],
+                "Base LTL ($)":           res["Base LTL"],
+                "OOA Charge ($)":         res["OOA charge"],
+                "Accessorials ($)":       res["Accessorials (non-fuel)"],
+                "Wait Time Charge ($)":   res["Wait Time charge"],
+                "Fuel Amount ($)":        res["Fuel amount"],
+                "Grand Total ($)":        res["Grand Total"],
+            }
+
         if st.session_state.batch_mode:
             st.session_state.batch_idx += 1
+        if st.session_state.csv_mode:
+            st.session_state.csv_idx += 1
 
-        # Reset single PDF state
-        st.session_state.pdf_parsed    = False
-        st.session_state.pdf_weight    = 0.0
-        st.session_state.pdf_consignee = ""
-        st.session_state.pdf_ref       = ""
-        st.session_state.pdf_dg        = ""
-
+        st.session_state.pdf_parsed      = False
+        st.session_state.pdf_weight      = 0.0
+        st.session_state.pdf_consignee   = ""
+        st.session_state.pdf_ref         = ""
+        st.session_state.pdf_dg          = ""
+        st.session_state.auto_distance_km = None
 
         st.rerun()
 
