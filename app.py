@@ -12,13 +12,12 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL      = "https://router.project-osrm.org/route/v1/driving"
 NOMINATIM_HEADERS = {"User-Agent": "VAREK-CEVA-Calculator/1.0 (personal use)"}
 
-def geocode_address(address1, city, state, zipcode):
-    query = f"{address1}, {city}, {state}, {zipcode}, Canada"
+def _nominatim_query(query):
     try:
         resp = requests.get(
             NOMINATIM_URL,
             params={"q": query, "format": "json", "limit": 1, "countrycodes": "ca"},
-            headers=NOMINATIM_HEADERS, timeout=8,
+            headers=NOMINATIM_HEADERS, timeout=10,
         )
         resp.raise_for_status()
         results = resp.json()
@@ -28,11 +27,32 @@ def geocode_address(address1, city, state, zipcode):
         pass
     return None
 
+def geocode_address(address1, city, state, zipcode):
+    """
+    Progressive fallback geocoding. Exact street addresses often fail on
+    abbreviated street types ('68 ST SE') and in small northern communities
+    with thin OpenStreetMap coverage. Falling back to city/postal level still
+    gives a usable number: the zone bands are 50/150/300/400/500 km wide, so
+    being a few km off almost never changes which zone a shipment lands in.
+    Returns (coords, precision_label).
+    """
+    attempts = [
+        (f"{address1}, {city}, {state}, {zipcode}, Canada", "exact"),
+        (f"{city}, {state}, {zipcode}, Canada",             "city+postal"),
+        (f"{zipcode}, Canada",                              "postal"),
+        (f"{city}, {state}, Canada",                        "city"),
+    ]
+    for query, precision in attempts:
+        time.sleep(1.0)  # Nominatim usage policy: ~1 req/sec
+        coords = _nominatim_query(query)
+        if coords:
+            return coords, precision
+    return None, "failed"
+
 def geocode_cached(address1, city, state, zipcode, cache):
     key = f"{address1}|{city}|{state}|{zipcode}".upper().strip()
     if key in cache:
         return cache[key]
-    time.sleep(1.0)  # Nominatim usage policy: ~1 req/sec
     result = geocode_address(address1, city, state, zipcode)
     cache[key] = result
     return result
@@ -664,23 +684,44 @@ if st.session_state.csv_queue:
         with col_a:
             if st.button("📍 Auto-calculate distance", key=f"dist_{idx}"):
                 with st.spinner("Geocoding addresses and routing..."):
-                    origin = geocode_cached(
+                    origin, o_prec = geocode_cached(
                         current["shipper_address1"], current["shipper_city"],
                         current["shipper_state"], current["shipper_zip"],
                         st.session_state.geocode_cache,
                     )
-                    dest = geocode_cached(
+                    dest, d_prec = geocode_cached(
                         current["consignee_address1"], current["consignee_city"],
                         current["consignee_state"], current["consignee_zip"],
                         st.session_state.geocode_cache,
                     )
-                    dist = driving_distance_km(origin, dest)
-                    if dist is not None:
-                        st.session_state.auto_distance_km = dist
-                        st.success(f"Estimated driving distance: {dist} km — always spot-check this against the zone before billing.")
-                    else:
+
+                    if origin is None or dest is None:
                         st.session_state.auto_distance_km = None
-                        st.error("Couldn't geocode one or both addresses — enter distance manually.")
+                        which = []
+                        if origin is None: which.append(f"shipper ({current['shipper_city']})")
+                        if dest is None:   which.append(f"consignee ({current['consignee_city']})")
+                        st.error(f"Couldn't geocode: {', '.join(which)}. Enter distance manually.")
+                    else:
+                        dist = driving_distance_km(origin, dest)
+                        if dist is None:
+                            st.session_state.auto_distance_km = None
+                            st.error(
+                                "Addresses found, but no driving route exists between them "
+                                f"({current['shipper_city']} → {current['consignee_city']}). "
+                                "Fly-in/remote destination, or this leg isn't driven end-to-end. Enter distance manually."
+                            )
+                        else:
+                            st.session_state.auto_distance_km = dist
+                            msg = f"Estimated driving distance: {dist} km"
+                            if o_prec != "exact" or d_prec != "exact":
+                                msg += f" — ⚠️ approximate (shipper: {o_prec}, consignee: {d_prec})"
+                            st.success(msg + ". Always spot-check against the zone before billing.")
+                            if dist > 500:
+                                st.warning(
+                                    f"⚠️ {dist} km exceeds the 500 km Zone 5 ceiling in this tariff — "
+                                    "this shipment can't be priced with the current rate table. "
+                                    "Check with CEVA which two points the billed distance is measured between."
+                                )
         with col_b:
             suggested = [k for k, v in current.get("suggested_accessorials", {}).items() if v]
             if suggested:
